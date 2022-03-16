@@ -22,7 +22,7 @@ import (
 const (
 	KeywordExit string = "EXIT"
 
-	ExitSuccess int = 1
+	ExitSuccess int = 0
 )
 
 var (
